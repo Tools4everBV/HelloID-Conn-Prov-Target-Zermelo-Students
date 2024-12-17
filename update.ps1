@@ -57,8 +57,8 @@ function Get-DepartmentToAssign {
         $DepartmentName,
 
         [Parameter()]
-        [DateTime]
-        $ContractStartDate
+        [string]
+        $SchoolYear
     )
 
     try {
@@ -67,16 +67,11 @@ function Get-DepartmentToAssign {
             Endpoint = 'departmentsofbranches'
         }
         $responseDepartments = (Invoke-ZermeloRestMethod @splatParams).response.data
-        [DateTime]$currentSchoolYear = Get-CurrentSchoolYear -ContractStartDate $ContractStartDate
 
         if ($null -ne $responseDepartments) {
-            $contractStartDate = $currentSchoolYear
-            $schoolNameToMatch = $SchoolName
-            $schoolYearToMatch = "$($contractStartDate.Year)" + '-' + "$($contractStartDate.AddYears(1).Year)"
-
             $lookup = $responseDepartments | Group-Object -AsHashTable -Property 'code'
             $departments = $lookup[$DepartmentName]
-            $departmentToAssign = $departments | Where-Object { $_.schoolInSchoolYearName -match "$schoolNameToMatch $schoolYearToMatch" }
+            $departmentToAssign = $departments | Where-Object { $_.schoolInSchoolYearName -match "$schoolNameToMatch $SchoolYear" }
             Write-Output $departmentToAssign
         }
     } catch {
@@ -249,7 +244,7 @@ try {
 
     # Exclude departmentOfBranch fields from the actionContext.Data to retrieve only the fields managed by HelloID
     # We also create a new object 'actionContextDataFiltered' for a solid compare
-    $excludedFields = 'schoolName', 'classRoom', 'participationWeight', 'startDate'
+    $excludedFields = 'schoolName', 'classRoom', 'participationWeight', 'startDate', 'isStudent', 'code'
     $actionContextDataFiltered = [PSCustomObject]@{}
     foreach ($property in $actionContext.Data.PSObject.Properties) {
         if ($property.Name -notin $excludedFields) {
@@ -266,15 +261,19 @@ try {
         throw
     }
 
-    if (-not [string]::IsNullOrWhiteSpace($actionContext.Data.schoolName) -and
-    -not [string]::IsNullOrWhiteSpace($actionContext.Data.classRoom) -and
+    if (-not [string]::IsNullOrEmpty($actionContext.Data.schoolName) -and
+    -not [string]::IsNullOrEmpty($actionContext.Data.classRoom) -and
     $actionContext.Data.startDate -ne [DateTime]::MinValue) {
+        Write-Information 'Determine school year based on the startDate specified in [actionContext.Data.startDate]'
+        $currentSchoolYear = Get-CurrentSchoolYear -ContractStartDate $($actionContext.Data.startDate)
+        $schoolYearToMatch = "$($currentSchoolYear.Year)" + '-' + "$($currentSchoolYear.AddYears(1).Year)"
+
         Write-Information 'Determine which departmentOfBranch will need to be assigned'
         try {
             $splatGetDepartmentToAssign = @{
                 SchoolName        = $actionContext.Data.schoolName
                 DepartmentName    = $actionContext.Data.classRoom
-                ContractStartDate = $actionContext.Data.startDate
+                SchoolYear        = $schoolYearToMatch
             }
             $departmentToAssign = Get-DepartmentToAssign @splatGetDepartmentToAssign
             $dryRunMessageDepartmentOfBranchToAssign = "SchoolName: [$($actionContext.Data.schoolName) $($actionContext.Data.startDate)] for classRoom: [$($actionContext.Data.classRoom)] will be assigned"
@@ -286,78 +285,64 @@ try {
     # Define the empty array of actions that will be processed during enforcement
     $actions = @()
 
-    # Triggered directly after initial create and correlate
-    if ($actionContext.AccountCorrelated) {
-        Write-Information 'Verify if the classroom must be updated after correlation'
-        if ($null -ne $departmentToAssign){
-            Write-Information "Department: [$($departmentToAssign.schoolInSchoolYearName)] with id: [$($departmentToAssign.id)] will be assigned"
-            $actions += 'Update-DepartmentOfBranch'
-        } else {
-            Write-Information "A classroom with schoolName: [$($actionContext.Data.schoolName) $($actionContext.Data.startDate)] for classRoom: [$($actionContext.Data.classRoom)] cannot be found"
+    # Check for changes within the personDifferences object
+    Write-Information 'Verify if the user account must be updated'
+    if ($null -ne $correlatedAccount) {
+        $splatCompareProperties = @{
+            ReferenceObject  = @($correlatedAccount.PSObject.Properties)
+            DifferenceObject = @($actionContextDataFiltered.PSObject.Properties)
         }
+        $userPropertiesChanged = (Compare-Object @splatCompareProperties -PassThru).Where({$_.SideIndicator -eq '=>'})
+        if ($userPropertiesChanged -and ($null -ne $correlatedAccount)) {
+            $actions += 'Update-Account'
+            $dryRunMessage = "Account property(s) required to update: [$($userPropertiesChanged.name -join ",")]"
+
+            $updateObject = [PSCustomObject]@{}
+            foreach ($property in $userPropertiesChanged) {
+                $updateObject | Add-Member -MemberType NoteProperty -Name $property.Name -Value $property.Value
+            }
+        } elseif (-not($userPropertiesChanged)) {
+            $actions += 'NoChangesToUser'
+            $dryRunMessage = 'No changes will be made to the account during enforcement'
+        }
+    } else {
+        $actions += 'UserNotFound'
+        $dryRunMessage = "Zermelo account for: [$($personContext.Person.DisplayName)] not found. Possibly deleted"
     }
 
-    # Triggered only in case of an update event
-    # In this case we check for changes within the personDifferences object
-    if (-not $actionContext.AccountCorrelated) {
-        Write-Information 'Verify if the user account must be updated'
-        if ($null -ne $correlatedAccount) {
-            $splatCompareProperties = @{
-                ReferenceObject  = @($correlatedAccount.PSObject.Properties)
-                DifferenceObject = @($actionContextDataFiltered.PSObject.Properties)
-            }
-            $userPropertiesChanged = (Compare-Object @splatCompareProperties -PassThru).Where({$_.SideIndicator -eq '=>'})
-            if ($userPropertiesChanged -and ($null -ne $correlatedAccount)) {
-                $actions += 'Update-Account'
-                $dryRunMessage = "Account property(s) required to update: [$($userPropertiesChanged.name -join ",")]"
+    # A change to either the school or classroom will always result in an assignment of a new 'departmentOfBranch'
+    # A 'departmentOfBranch' always includes both the school, year and classroom information
+    Write-Information 'Verify if the school or classroom  must be updated'
+    $departmentUpdated = $false
 
-                $updateObject = [PSCustomObject]@{}
-                foreach ($property in $userPropertiesChanged) {
-                    $updateObject | Add-Member -MemberType NoteProperty -Name $property.Name -Value $property.Value
-                }
-            } elseif (-not($userPropertiesChanged)) {
-                $actions += 'NoChangesToUser'
-                $dryRunMessage = 'No changes will be made to the account during enforcement'
+    if ($null -eq $departmentToAssign) {
+        $actions += 'DepartmentOfBranchNotFound'
+    } else {
+        # Check if the school must be updated
+        $schoolValue = Get-NestedPropertyValue -Object $personContext.PersonDifferences.PrimaryContract -PropertyPath $actionContext.Configuration.SchoolNameField
+        if (-not [string]::IsNullOrEmpty($schoolValue)) {
+            $pdHash = ConvertTo-HashTableToObject -HashTableString $schoolValue
+            if (($pdHash.Change -eq 'updated') -and ($actionContext.Data.schoolName -match $pdHash.New)) {
+                $actions += 'Update-DepartmentOfBranch'
+                $departmentUpdated = $true
             }
-        } else {
-            $actions += 'UserNotFound'
-            $dryRunMessage = "Zermelo account for: [$($personContext.Person.DisplayName)] not found. Possibly deleted"
         }
 
-        # A change to either the school or classroom will always result in an assignment of a new 'departmentOfBranch'
-        # A 'departmentOfBranch' always includes both the school, year and classroom information
-        Write-Information 'Verify if the school or classroom  must be updated'
-        $departmentUpdated = $false
-
-        if ($null -eq $departmentToAssign) {
-            $actions += 'DepartmentOfBranchNotFound'
-        } else {
-            # Check if the school must be updated
-            $schoolValue = Get-NestedPropertyValue -Object $personContext.PersonDifferences.PrimaryContract -PropertyPath $actionContext.Configuration.SchoolNameField
-            if (-not [string]::IsNullOrEmpty($schoolValue)) {
-                $pdHash = ConvertTo-HashTableToObject -HashTableString $schoolValue
-                if (($pdHash.Change -eq 'updated') -and ($actionContext.Data.schoolName -match $pdHash.New)) {
+        # Check if the classroom must be updated
+        $classroomValue = Get-NestedPropertyValue -Object $personContext.PersonDifferences.PrimaryContract -PropertyPath $actionContext.Configuration.ClassroomField
+        if (-not [string]::IsNullOrEmpty($classroomValue)) {
+            $pdHash = ConvertTo-HashTableToObject -HashTableString $classroomValue
+            if (($pdHash.Change -eq 'updated') -and ($actionContext.Data.classRoom -match $pdHash.New)) {
+                if (-not $departmentUpdated) {
                     $actions += 'Update-DepartmentOfBranch'
                     $departmentUpdated = $true
                 }
             }
+        }
 
-            # Check if the classroom must be updated
-            $classroomValue = Get-NestedPropertyValue -Object $personContext.PersonDifferences.PrimaryContract -PropertyPath $actionContext.Configuration.ClassroomField
-            if (-not [string]::IsNullOrEmpty($classroomValue)) {
-                $pdHash = ConvertTo-HashTableToObject -HashTableString $classroomValue
-                if (($pdHash.Change -eq 'updated') -and ($actionContext.Data.classRoom -match $pdHash.New)) {
-                    if (-not $departmentUpdated) {
-                        $actions += 'Update-DepartmentOfBranch'
-                        $departmentUpdated = $true
-                    }
-                }
-            }
-
-            # If no department or school update was made
-            if (-not $departmentUpdated) {
-                $actions += 'NoChangesToDepartmentOfBranch'
-            }
+        # If no department or school update was made
+        if (-not $departmentUpdated) {
+            $actions += 'NoChangesToDepartmentOfBranch'
         }
     }
 

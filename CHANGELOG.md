@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file. The format is based on [Keep a Changelog](https://keepachangelog.com), and this project adheres to [Semantic Versioning](https://semver.org)
 
+## [1.2.0] - 16-12-2024
+
+- Assigning a departmentOfBranch is now part of the create lifecycle.
+    - The assignment is optional and will only be performed if the `classRoom` and `schoolName` fields in the field mapping have values. To support this, the actions array has also been added to the create lifecycle.
+- Simplified the `Get-DepartmentToAssign` function in both the create and update lifecycle actions.
+
 ## [1.1.0] - 08-08-2024
 
 - From version `1.1.0` its possible to create a user account without assigning a department/school.

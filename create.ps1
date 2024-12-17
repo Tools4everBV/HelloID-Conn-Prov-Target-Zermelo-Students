@@ -44,6 +44,40 @@ function Get-ZermeloAccount {
     }
 }
 
+function Get-DepartmentToAssign {
+    [CmdletBinding()]
+    param (
+        [Parameter()]
+        [string]
+        $SchoolName,
+
+        [Parameter()]
+        [string]
+        $DepartmentName,
+
+        [Parameter()]
+        [string]
+        $SchoolYear
+    )
+
+    try {
+        $splatParams = @{
+            Method   = 'GET'
+            Endpoint = 'departmentsofbranches'
+        }
+        $responseDepartments = (Invoke-ZermeloRestMethod @splatParams).response.data
+
+        if ($null -ne $responseDepartments) {
+            $lookup = $responseDepartments | Group-Object -AsHashTable -Property 'code'
+            $departments = $lookup[$DepartmentName]
+            $departmentToAssign = $departments | Where-Object { $_.schoolInSchoolYearName -match "$schoolNameToMatch $SchoolYear" }
+            Write-Output $departmentToAssign
+        }
+    } catch {
+        $PSCmdlet.ThrowTerminatingError($_)
+    }
+}
+
 function Get-CurrentSchoolYear {
     [CmdletBinding()]
     param (
@@ -162,6 +196,9 @@ try {
     $IsStudentAccountCreated = $false
     $outputContext.AccountReference = 'Currently not available'
 
+    # Define the empty array of actions that will be processed during enforcement
+    $actions = @()
+
     if ([string]::IsNullOrEmpty($($actionContext.Data.code))) {
         throw 'Mandatory attribute [code] is empty. Please make sure it is correctly mapped'
     }
@@ -221,28 +258,55 @@ try {
         }
     }
 
+    # Validate if we need to update the department
+    if (-not [string]::IsNullOrEmpty($actionContext.Data.schoolName) -and
+    -not [string]::IsNullOrEmpty($actionContext.Data.classRoom) -and
+    $actionContext.Data.startDate -ne [DateTime]::MinValue) {
+        Write-Information 'Determine school year based on the startDate specified in [actionContext.Data.startDate]'
+        $currentSchoolYear = Get-CurrentSchoolYear -ContractStartDate $($actionContext.Data.startDate)
+        $schoolYearToMatch = "$($currentSchoolYear.Year)" + '-' + "$($currentSchoolYear.AddYears(1).Year)"
+
+        Write-Information 'Determine which departmentOfBranch will need to be assigned'
+        try {
+            $splatGetDepartmentToAssign = @{
+                SchoolName        = $actionContext.Data.schoolName
+                DepartmentName    = $actionContext.Data.classRoom
+                SchoolYear        = $schoolYearToMatch
+            }
+            $departmentToAssign = Get-DepartmentToAssign @splatGetDepartmentToAssign
+            if ($null -ne $departmentToAssign){
+                $actions += 'Update-DepartmentOfBranch'
+                $dryRunMessageDepartmentOfBranchToAssign = "SchoolName: [$($actionContext.Data.schoolName) $($actionContext.Data.startDate)] for classRoom: [$($actionContext.Data.classRoom)] will be assigned"
+            } else {
+                $dryRunMessageDepartmentOfBranchToAssign = "A classroom with schoolName: [$($actionContext.Data.schoolName) $($actionContext.Data.startDate)] for classRoom: [$($actionContext.Data.classRoom)] cannot be found"
+            }
+        } catch {
+            throw
+        }
+    }
+
     # If both the user and student account don't exist, create the user account (with the isStudent set to true) and correlate
     # Note that 'isStudent = $true' will automatically create the student account
     if (-not($isUserAccountCreated) -and (-not($isStudentAccountCreated))){
-        $action = 'Create-Correlate'
+        $actions += 'Create-Correlate'
     }
 
     # If we have a user account but no student account, update the user account (with isStudent) and correlate
     # Note that 'isStudent = $true' will automatically create the student account
     if ($isUserAccountCreated -eq $true -and -not $isStudentAccountCreated){
-        $action = 'Create-StudentAccount-Correlate-User'
+        $actions += 'Create-StudentAccount-Correlate-User'
     }
 
     # If we have a student account but no user account, create the user account (with isStudent) and correlate
     # Note that 'isStudent = $true' will automatically create the student account
     if ($isStudentAccountCreated -eq $true -and -not $isUserAccountCreated){
-        $action = 'Create-Correlate'
+        $actions += 'Create-Correlate'
     }
 
     # If we have both a user and student account, match the userCode. If a match is found, correlate
     if ($isUserAccountCreated -and $isStudentAccountCreated){
         if ($responseUser.code -eq $responseStudent.userCode) {
-            $action = 'Correlate'
+            $actions += 'Correlate'
             $outputContext.AccountReference = $responseUser.code
         }
     }
@@ -250,61 +314,114 @@ try {
     # Add a message and the result of each of the validations showing what will happen during enforcement
     if ($actionContext.DryRun -eq $true) {
         Write-Information "[DryRun] $action Zermelo account for: [$($personContext.Person.DisplayName)], will be executed during enforcement" -Verbose
+        if ($null -ne $dryRunMessageDepartmentOfBranchToAssign){
+            Write-Information "[DryRun] $dryRunMessageDepartmentOfBranchToAssign"
+        }
+    }
+
+    # Separate 'Update-DepartmentOfBranch' from other actions to make sure we always loop through the actions in a specific order
+    $orderedActions = @($actions | Where-Object { $_ -notin @('Update-DepartmentOfBranch') })
+    if ($actions -contains 'Update-DepartmentOfBranch') {
+        $orderedActions += 'Update-DepartmentOfBranch'
     }
 
     # Process
     if (-not($actionContext.DryRun -eq $true)) {
-        switch ($action) {
-            'Create-Correlate' {
-                Write-Information 'Creating and correlating Zermelo account'
-                $splatCreateUserParams = @{
-                    Endpoint    = 'users'
-                    Method      = 'POST'
-                    Body        = $actionContextDataFiltered | ConvertTo-Json
-                    ContentType = 'application/json'
+        foreach ($action in $orderedActions){
+            switch ($action) {
+                'Create-Correlate' {
+                    Write-Information 'Creating and correlating Zermelo account'
+                    $splatCreateUserParams = @{
+                        Endpoint    = 'users'
+                        Method      = 'POST'
+                        Body        = $actionContextDataFiltered | ConvertTo-Json
+                        ContentType = 'application/json'
+                    }
+                    $responseCreateUserAccount = Invoke-ZermeloRestMethod @splatCreateUserParams
+
+                    $outputContext.AccountCorrelated = $true
+                    $outputContext.Data = $responseCreateUserAccount.response.data
+                    $outputContext.AccountReference = $responseCreateUserAccount.response.data.code
+
+                    $outputContext.AuditLogs.Add([PSCustomObject]@{
+                        Action  = 'CreateAccount'
+                        Message = "Create-Correlate account was successful. AccountReference is: [$($outputContext.AccountReference)]"
+                        IsError = $false
+                    })
+                    break
                 }
-                $responseCreateUserAccount = Invoke-ZermeloRestMethod @splatCreateUserParams
 
-                $outputContext.AccountCorrelated = $true
-                $outputContext.Data = $responseCreateUserAccount.response.data
-                $outputContext.AccountReference = $responseCreateUserAccount.response.data.code
-                break
-            }
+                'Create-StudentAccount-Correlate-User'{
+                    Write-Information 'Creating Zermelo student account and correlating user account'
+                    $splatCreateStudentParams = @{
+                        Endpoint    = "users/$($responseUser.code)"
+                        Method      = 'PUT'
+                        Body        = @{
+                            isStudent = $actionContext.Data.isStudent
+                        } | ConvertTo-Json
+                        ContentType = 'application/json'
+                    }
+                    $null = Invoke-ZermeloRestMethod @splatCreateStudentParams
 
-            'Create-StudentAccount-Correlate-User'{
-                Write-Information 'Creating Zermelo student account and correlating user account'
-                $splatCreateStudentParams = @{
-                    Endpoint    = "users/$($responseUser.code)"
-                    Method      = 'PUT'
-                    Body        = @{
-                        isStudent = $actionContext.Data.isStudent
-                    } | ConvertTo-Json
-                    ContentType = 'application/json'
+                    $outputContext.AccountCorrelated = $true
+                    $outputContext.Data = $responseUser
+                    $outputContext.AccountReference = $responseUser.code
+
+                    $outputContext.AuditLogs.Add([PSCustomObject]@{
+                        Action  = 'CreateAccount'
+                        Message = "Create-StudentAccount-Correlate-User account was successful. AccountReference is: [$($outputContext.AccountReference)]"
+                        IsError = $false
+                    })
+                    break
                 }
-                $null = Invoke-ZermeloRestMethod @splatCreateStudentParams
 
-                $outputContext.AccountCorrelated = $true
-                $outputContext.Data = $responseUser
-                $outputContext.AccountReference = $responseUser.code
-                break
-            }
+                'Correlate' {
+                    Write-Information 'Correlating Zermelo user account'
+                    $outputContext.AccountCorrelated = $true
+                    $outputContext.Data = $responseUser
+                    $outputContext.AccountReference = $responseUser.code
 
-            'Correlate' {
-                Write-Information 'Correlating Zermelo user account'
-                $outputContext.AccountCorrelated = $true
-                $outputContext.Data = $responseUser
-                $outputContext.AccountReference = $responseUser.code
-                break
+                    $outputContext.AuditLogs.Add([PSCustomObject]@{
+                        Action  = 'CreateAccount'
+                        Message = "Correlate account was successful. AccountReference is: [$($outputContext.AccountReference)]"
+                        IsError = $false
+                    })
+                    break
+                }
+
+                'Update-DepartmentOfBranch' {
+                    Write-Information "Updating departmentOfBranch for Zermelo account with accountReference: [$($actionContext.References.Account)]"
+                    Write-Information "New department: [$($departmentToAssign.schoolInSchoolYearName)] with id: [$($departmentToAssign.id)] will be assigned"
+                    $splatStudentInDepartmentParams = @{
+                        Endpoint    = 'studentsindepartments'
+                        Method      = 'POST'
+                        Body        = @{
+                            departmentOfBranch  = $departmentToAssign.id
+                            student             = $outputContext.Data.code
+                            participationWeight = $actionContext.Data.participationWeight
+                        } | ConvertTo-Json
+                        ContentType = 'application/json'
+                    }
+                    try {
+                        $null = Invoke-ZermeloRestMethod @splatStudentInDepartmentParams
+                        $auditLogMessage = 'DepartmentOfBranch created'
+                    } catch {
+                        if ($_.Exception.StatusCode -eq 409){
+                            $auditLogMessage = 'DepartmentOfBranch already exists'
+                        } else {
+                            throw
+                        }
+                    }
+
+                    $outputContext.AuditLogs.Add([PSCustomObject]@{
+                        Message = "Update-DepartmentOfBranch was successful with message: [$auditLogMessage]. Department set to: [$($departmentToAssign.schoolInSchoolYearName)] with id: [$($departmentToAssign.id)]"
+                        IsError = $false
+                    })
+                    break
+                }
             }
         }
-
-        $auditLogMessage = "$action account was successful. AccountReference is: [$($outputContext.AccountReference)]"
         $outputContext.success = $true
-        $outputContext.AuditLogs.Add([PSCustomObject]@{
-            Action  = 'CreateAccount'
-            Message = $auditLogMessage
-            IsError = $false
-        })
     }
 } catch {
     $outputContext.success = $false
